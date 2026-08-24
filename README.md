@@ -1,26 +1,26 @@
 # Filer
 
-Filer, macOS menu bar'dan acilan native bir popup uygulamasidir.
+Filer is a native macOS popup utility opened from the menu bar.
 
-## Amaci
+## Purpose
 
-Panodaki veya metin alanindaki icerigi gecici bir `file.txt` dosyasina donusturur ve dosyayi Finder'da kopyalanmis gibi panoya koyar.
+It converts clipboard or editor text into a temporary `file.txt` and places the file on the clipboard as if it had been copied from Finder.
 
-## Cozdugu Problem
+## Problem It Solves
 
-Metin icerigini kalici bir dosya olusturmadan Finder'a, sohbet uygulamalarina veya dosya yukleme alanlarina dosya olarak aktarir. Her seferinde ayni gecici dosyanin uzerine yazar.
+Filer lets you share text as a file with Finder, chat applications, or file upload fields without creating a permanent file. Each generation overwrites the same temporary file.
 
-## Kurulum
+## Installation
 
 ```zsh
 ./build-app.zsh
 open -n -g "./build/Filer.app"
 ```
 
-Ardindan menu bardaki `F` ikonuna tiklayin veya `Ctrl + Option + Cmd + F` kisayolunu kullanin. Metni yapistirip `Copy as file.txt` secenegine basin; ayni kisayol popup acikken tekrar basilirsa kapatir.
+Click the `F` menu bar icon or press `Ctrl + Option + Cmd + F`. Paste your text and select `Copy as file.txt`; pressing the same shortcut while the popup is open closes it.
 
-Dosya `FileManager.default.temporaryDirectory/Filer/file.txt` altinda tutulur. Uygulama kalici dosya arsivi tutmaz.
+The file is stored at `FileManager.default.temporaryDirectory/Filer/file.txt`. Filer does not keep a permanent file archive.
 
-DMG olusturmak icin `./build-dmg.zsh` komutunu kullanin. Debug durumlarini gormek icin `FILER_DEBUG=1 ./build-app.zsh` ile derleyin.
+Create a DMG with `./build-dmg.zsh`. Build with `FILER_DEBUG=1 ./build-app.zsh` to show debug status messages.
 
-Apple Silicon ve macOS 26+ icin derlenir.
+Requires Apple Silicon and macOS 26+.
