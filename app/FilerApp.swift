@@ -1,12 +1,20 @@
 import AppKit
 import Carbon
 import Foundation
+import QuartzCore
 
 private let appName = "Filer"
 private let statusTitle = "F"
 private let hotkeyDescription = "Ctrl + Option + Cmd + F"
 private let outputDirectoryName = "Filer"
 private let outputFileName = "file.txt"
+private let successSoundName = "Blow"
+
+#if FILER_DEBUG
+private let debugBuild = true
+#else
+private let debugBuild = false
+#endif
 
 private enum FilerError: LocalizedError {
     case clipboardDoesNotContainText
@@ -67,6 +75,40 @@ private final class FilerTextView: NSTextView {
     }
 }
 
+private final class FilerPopupBackgroundView: NSVisualEffectView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .hudWindow
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = 20
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        updateBorderColor()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateBorderColor()
+    }
+
+    private func updateBorderColor() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let color = isDark ? NSColor.white : NSColor.black
+        layer?.borderColor = color.withAlphaComponent(0.14).cgColor
+    }
+}
+
+private final class FilerPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let fileManager = FileManager.default
 
@@ -75,7 +117,10 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
     private var editorPanel: NSPanel?
     private var editorTextView: FilerTextView?
     private var statusLabel: NSTextField?
-    private var hasPositionedEditor = false
+    private var successOverlay: NSVisualEffectView?
+    private var successIconView: NSImageView?
+    private var successDismissWorkItem: DispatchWorkItem?
+    private var activeFeedbackSound: NSSound?
 
     private var outputURL: URL {
         fileManager.temporaryDirectory
@@ -176,22 +221,26 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
     private func setupEditorPanel() {
         let frame = NSRect(x: 0, y: 0, width: 640, height: 480)
-        let panel = NSPanel(
+        let panel = FilerPanel(
             contentRect: frame,
-            styleMask: [.titled, .closable, .resizable],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Filer"
-        panel.minSize = NSSize(width: 480, height: 360)
         panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
         panel.isFloatingPanel = true
+        panel.isMovableByWindowBackground = true
+        panel.becomesKeyOnlyIfNeeded = false
         panel.hidesOnDeactivate = false
+        panel.ignoresMouseEvents = false
         panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.delegate = self
 
-        let rootView = NSView()
+        let rootView = FilerPopupBackgroundView()
         panel.contentView = rootView
 
         let titleLabel = NSTextField(labelWithString: "Create file.txt")
@@ -251,14 +300,17 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         copyButton.keyEquivalentModifierMask = [.command]
 
         let closeButton = NSButton(
-            title: "Close",
+            image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close")!,
             target: self,
             action: #selector(closeEditor)
         )
-        closeButton.bezelStyle = .rounded
+        closeButton.isBordered = false
+        closeButton.imageScaling = .scaleProportionallyDown
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.toolTip = "Close"
 
         let spacer = NSView()
-        let buttonStack = NSStackView(views: [pasteButton, clearButton, spacer, copyButton, closeButton])
+        let buttonStack = NSStackView(views: [pasteButton, clearButton, spacer, copyButton])
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
@@ -281,15 +333,40 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.maximumNumberOfLines = 1
 
-        [titleLabel, subtitleLabel, scrollView, buttonStack, pathLabel, statusLabel].forEach {
+        let successOverlay = NSVisualEffectView()
+        successOverlay.material = .hudWindow
+        successOverlay.blendingMode = .withinWindow
+        successOverlay.state = .active
+        successOverlay.wantsLayer = true
+        successOverlay.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.82).cgColor
+        successOverlay.isHidden = true
+        successOverlay.alphaValue = 0
+
+        let successIconView = NSImageView()
+        successIconView.image = NSImage(
+            systemSymbolName: "checkmark.circle.fill",
+            accessibilityDescription: "Copied"
+        )
+        successIconView.contentTintColor = .systemGreen
+        successIconView.imageScaling = .scaleProportionallyUpOrDown
+        successIconView.wantsLayer = true
+        successIconView.translatesAutoresizingMaskIntoConstraints = false
+        successOverlay.addSubview(successIconView)
+
+        [titleLabel, subtitleLabel, scrollView, buttonStack, pathLabel, statusLabel, closeButton, successOverlay].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             rootView.addSubview($0)
         }
 
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             titleLabel.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 20),
             titleLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
-            titleLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+            titleLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -64),
+
+            closeButton.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 16),
+            closeButton.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -16),
+            closeButton.widthAnchor.constraint(equalToConstant: 24),
+            closeButton.heightAnchor.constraint(equalToConstant: 24),
 
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             subtitleLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
@@ -305,15 +382,33 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
             buttonStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
             buttonStack.heightAnchor.constraint(equalToConstant: 32),
 
-            pathLabel.topAnchor.constraint(equalTo: buttonStack.bottomAnchor, constant: 12),
-            pathLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
-            pathLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+            successOverlay.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            successOverlay.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
+            successOverlay.topAnchor.constraint(equalTo: rootView.topAnchor),
+            successOverlay.bottomAnchor.constraint(equalTo: rootView.bottomAnchor),
 
-            statusLabel.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 3),
-            statusLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
-            statusLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
-            statusLabel.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -16),
-        ])
+            successIconView.centerXAnchor.constraint(equalTo: successOverlay.centerXAnchor),
+            successIconView.centerYAnchor.constraint(equalTo: successOverlay.centerYAnchor),
+            successIconView.widthAnchor.constraint(equalToConstant: 96),
+            successIconView.heightAnchor.constraint(equalToConstant: 96),
+        ]
+
+        if debugBuild {
+            constraints += [
+                pathLabel.topAnchor.constraint(equalTo: buttonStack.bottomAnchor, constant: 12),
+                pathLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
+                pathLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+
+                statusLabel.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 3),
+                statusLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
+                statusLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+                statusLabel.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -16),
+            ]
+        } else {
+            constraints.append(buttonStack.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -16))
+        }
+
+        NSLayoutConstraint.activate(constraints)
 
         textView.onCommandReturn = { [weak self] in
             self?.copyAsFile()
@@ -325,6 +420,10 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         self.editorPanel = panel
         self.editorTextView = textView
         self.statusLabel = statusLabel
+        self.successOverlay = successOverlay
+        self.successIconView = successIconView
+        pathLabel.isHidden = !debugBuild
+        statusLabel.isHidden = !debugBuild
     }
 
     @objc private func showEditorFromStatusBar() {
@@ -335,22 +434,63 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         showEditor(source: "menu")
     }
 
+    private func toggleEditor(source: String) {
+        guard let editorPanel else { return }
+
+        if editorPanel.isVisible {
+            closeEditor()
+        } else {
+            showEditor(source: source)
+        }
+    }
+
     private func showEditor(source: String) {
         guard let editorPanel, let editorTextView else { return }
 
-        if !hasPositionedEditor {
-            editorPanel.center()
-            hasPositionedEditor = true
+        resetSuccessOverlay()
+        if !debugBuild {
+            statusLabel?.stringValue = ""
+            statusLabel?.isHidden = true
         }
 
+        let wasVisible = editorPanel.isVisible
+        if !wasVisible {
+            clearEditorText()
+        }
+        centerEditorPanel()
+
         NSApp.activate(ignoringOtherApps: true)
+        if !wasVisible {
+            editorPanel.alphaValue = 0
+        }
         editorPanel.makeKeyAndOrderFront(nil)
         editorPanel.orderFrontRegardless()
         editorPanel.makeFirstResponder(editorTextView)
 
+        if !wasVisible {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                editorPanel.animator().alphaValue = 1
+            }
+        }
+
         if source != "status bar" {
             updateStatus("Editor opened from \(source).")
         }
+    }
+
+    private func centerEditorPanel() {
+        guard let editorPanel else { return }
+
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) ?? NSScreen.main
+        let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let origin = NSPoint(
+            x: round(visibleFrame.midX - editorPanel.frame.width / 2),
+            y: round(visibleFrame.midY - editorPanel.frame.height / 2)
+        )
+        editorPanel.setFrameOrigin(origin)
     }
 
     @objc private func pasteClipboard() {
@@ -369,10 +509,15 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     @objc private func clearText() {
-        editorTextView?.string = ""
-        editorTextView?.undoManager?.removeAllActions()
+        clearEditorText()
         editorPanel?.makeFirstResponder(editorTextView)
         updateStatus("Ready for text.")
+    }
+
+    private func clearEditorText() {
+        editorTextView?.string = ""
+        editorTextView?.undoManager?.removeAllActions()
+        editorTextView?.setSelectedRange(NSRange(location: 0, length: 0))
     }
 
     @objc private func copyAsFile() {
@@ -386,14 +531,100 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
             try writeTextFile(editorTextView.string)
             try copyFileToClipboard(outputURL)
             updateStatus("Copied file.txt to clipboard as a Finder file.")
-            editorPanel?.makeFirstResponder(editorTextView)
+            showSuccessAndClose()
         } catch {
             showError(error.localizedDescription)
         }
     }
 
+    private func showSuccessAndClose() {
+        guard let editorPanel, let successOverlay, let successIconView else {
+            closeEditor()
+            return
+        }
+
+        successDismissWorkItem?.cancel()
+        successDismissWorkItem = nil
+        editorTextView?.isEditable = false
+        editorTextView?.isSelectable = false
+        editorPanel.makeFirstResponder(nil)
+        editorPanel.alphaValue = 1
+        successOverlay.isHidden = false
+        successOverlay.alphaValue = 0
+        successIconView.alphaValue = 0
+        successIconView.layer?.removeAllAnimations()
+        playSuccessSound()
+
+        let popAnimation = CASpringAnimation(keyPath: "transform.scale")
+        popAnimation.fromValue = 0.55
+        popAnimation.toValue = 1.0
+        popAnimation.initialVelocity = 0.4
+        popAnimation.damping = 12
+        popAnimation.mass = 0.6
+        popAnimation.stiffness = 180
+        popAnimation.duration = popAnimation.settlingDuration
+        successIconView.layer?.add(popAnimation, forKey: "checkmark.pop")
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            successOverlay.animator().alphaValue = 1
+            successIconView.animator().alphaValue = 1
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.dismissSuccess()
+        }
+        successDismissWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.62, execute: workItem)
+    }
+
+    private func playSuccessSound() {
+        let soundURL = URL(fileURLWithPath: "/System/Library/Sounds/\(successSoundName).aiff")
+        guard fileManager.fileExists(atPath: soundURL.path),
+              let sound = NSSound(contentsOf: soundURL, byReference: true) else {
+            return
+        }
+
+        activeFeedbackSound = sound
+        sound.play()
+    }
+
+    private func dismissSuccess() {
+        successDismissWorkItem = nil
+        guard let editorPanel else {
+            resetSuccessOverlay()
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            editorPanel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            editorPanel.orderOut(nil)
+            editorPanel.alphaValue = 1
+            self.resetSuccessOverlay()
+        })
+    }
+
+    private func resetSuccessOverlay() {
+        successDismissWorkItem?.cancel()
+        successDismissWorkItem = nil
+        successOverlay?.isHidden = true
+        successOverlay?.alphaValue = 0
+        successIconView?.alphaValue = 1
+        successIconView?.layer?.removeAllAnimations()
+        editorTextView?.isEditable = true
+        editorTextView?.isSelectable = true
+    }
+
     @objc private func closeEditor() {
+        successDismissWorkItem?.cancel()
         editorPanel?.orderOut(nil)
+        editorPanel?.alphaValue = 1
+        resetSuccessOverlay()
     }
 
     @objc private func quitApp() {
@@ -422,12 +653,21 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
     }
 
     private func updateStatus(_ message: String) {
+        guard debugBuild else {
+            statusLabel?.stringValue = ""
+            statusLabel?.isHidden = true
+            statusItem?.button?.toolTip = "Open Filer (\(hotkeyDescription))"
+            return
+        }
+
+        statusLabel?.isHidden = false
         statusLabel?.stringValue = message
         statusLabel?.textColor = .secondaryLabelColor
         statusItem?.button?.toolTip = message
     }
 
     private func showError(_ message: String) {
+        statusLabel?.isHidden = false
         statusLabel?.stringValue = message
         statusLabel?.textColor = .systemRed
         statusItem?.button?.toolTip = message
@@ -447,7 +687,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         )
 
         guard status == noErr else {
-            updateStatus("Global hotkey registration failed.")
+            showError("Global hotkey registration failed.")
             return
         }
 
@@ -461,7 +701,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
             { _, _, userData in
                 guard let userData else { return noErr }
                 let app = Unmanaged<FilerApp>.fromOpaque(userData).takeUnretainedValue()
-                app.showEditor(source: "hotkey")
+                app.toggleEditor(source: "hotkey")
                 return noErr
             },
             1,

@@ -7,6 +7,11 @@ APP_DIR="$SCRIPT_DIR/build/Filer.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 TARGET_TRIPLE="arm64-apple-macos26.0"
+SWIFT_FLAGS=()
+
+if [[ "${FILER_DEBUG:-0}" == "1" ]]; then
+  SWIFT_FLAGS=(-D FILER_DEBUG)
+fi
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
@@ -17,6 +22,7 @@ swiftc "$SOURCE_FILE" \
   -framework AppKit \
   -framework Carbon \
   -framework Foundation \
+  "${SWIFT_FLAGS[@]}" \
   -o "$MACOS_DIR/Filer"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
