@@ -24,12 +24,14 @@ Filer
 1. Drag "Filer.app" into Applications.
 2. Open Filer from Applications.
 3. Click the F status bar icon or press Ctrl + Option + Cmd + F.
-4. Paste text into the editor.
-5. Click "Copy as file.txt" or press Command + Return.
-6. Paste the resulting file into Finder, a chat, or a file upload field.
+4. Enter a file name (file is the default).
+5. Paste text into the editor and choose the desired file extension from the dropdown (file.md is the default).
+6. Click the copy button or press Command + Return.
+7. Paste the resulting file into Finder, a chat, or a file upload field.
 
 The app always replaces the same file:
-the macOS temporary directory's Filer/file.txt.
+the macOS temporary directory's Filer/<name>.<extension>. The name resets to
+file and the extension to .md each time the panel opens.
 EOF
 
 rm -f "$DMG_PATH"

@@ -7,7 +7,19 @@ private let appName = "Filer"
 private let statusTitle = "F"
 private let hotkeyDescription = "Ctrl + Option + Cmd + F"
 private let outputDirectoryName = "Filer"
-private let outputFileName = "file.txt"
+private let defaultFileBaseName = "file"
+private let defaultFileExtension = ".md"
+private let fileExtensions = [
+    ".md",
+    ".txt",
+    ".json",
+    ".sql",
+    ".js",
+    ".html",
+    ".css",
+    ".py",
+    ".ts",
+]
 private let successSoundName = "Blow"
 
 #if FILER_DEBUG
@@ -19,6 +31,7 @@ private let debugBuild = false
 private enum FilerError: LocalizedError {
     case clipboardDoesNotContainText
     case clipboardWriteFailed
+    case invalidFileName
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +39,8 @@ private enum FilerError: LocalizedError {
             return "Clipboard does not contain plain text."
         case .clipboardWriteFailed:
             return "The file could not be copied to the clipboard."
+        case .invalidFileName:
+            return "Enter a file name without path separators."
         }
     }
 }
@@ -109,18 +124,29 @@ private final class FilerPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
-private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private let fileManager = FileManager.default
 
     private var hotKeyRef: EventHotKeyRef?
     private var statusItem: NSStatusItem?
     private var editorPanel: NSPanel?
     private var editorTextView: FilerTextView?
+    private var titleLabel: NSTextField?
+    private var copyButton: NSButton?
+    private var fileNameField: NSTextField?
+    private var extensionPopupButton: NSPopUpButton?
+    private var pathLabel: NSTextField?
     private var statusLabel: NSTextField?
     private var successOverlay: NSVisualEffectView?
     private var successIconView: NSImageView?
     private var successDismissWorkItem: DispatchWorkItem?
     private var activeFeedbackSound: NSSound?
+    private var selectedFileBaseName = defaultFileBaseName
+    private var selectedFileExtension = defaultFileExtension
+
+    private var outputFileName: String {
+        "\(selectedFileBaseName)\(selectedFileExtension)"
+    }
 
     private var outputURL: URL {
         fileManager.temporaryDirectory
@@ -243,7 +269,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         let rootView = FilerPopupBackgroundView()
         panel.contentView = rootView
 
-        let titleLabel = NSTextField(labelWithString: "Create file.txt")
+        let titleLabel = NSTextField(labelWithString: "Create \(outputFileName)")
         titleLabel.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
 
         let subtitleLabel = NSTextField(
@@ -291,13 +317,30 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         clearButton.bezelStyle = .rounded
 
         let copyButton = NSButton(
-            title: "Copy as file.txt",
+            title: "Copy as \(outputFileName)",
             target: self,
             action: #selector(copyAsFile)
         )
         copyButton.bezelStyle = .rounded
         copyButton.keyEquivalent = "\r"
         copyButton.keyEquivalentModifierMask = [.command]
+
+        let fileNameField = NSTextField(string: defaultFileBaseName)
+        fileNameField.isEditable = true
+        fileNameField.isSelectable = true
+        fileNameField.isBordered = true
+        fileNameField.bezelStyle = .roundedBezel
+        fileNameField.placeholderString = "File name"
+        fileNameField.toolTip = "Enter the file name"
+        fileNameField.delegate = self
+        fileNameField.widthAnchor.constraint(equalToConstant: 120).isActive = true
+
+        let extensionPopupButton = NSPopUpButton(frame: .zero, pullsDown: false)
+        extensionPopupButton.addItems(withTitles: fileExtensions)
+        extensionPopupButton.selectItem(withTitle: defaultFileExtension)
+        extensionPopupButton.target = self
+        extensionPopupButton.action = #selector(fileExtensionChanged(_:))
+        extensionPopupButton.toolTip = "Choose the file extension"
 
         let closeButton = NSButton(
             image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close")!,
@@ -310,7 +353,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         closeButton.toolTip = "Close"
 
         let spacer = NSView()
-        let buttonStack = NSStackView(views: [pasteButton, clearButton, spacer, copyButton])
+        let buttonStack = NSStackView(
+            views: [pasteButton, clearButton, spacer, fileNameField, extensionPopupButton, copyButton]
+        )
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
@@ -326,7 +371,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         pathLabel.maximumNumberOfLines = 1
         pathLabel.toolTip = outputURL.path
 
-        let statusLabel = NSTextField(labelWithString: "Paste text and click Copy as file.txt.")
+        let statusLabel = NSTextField(
+            labelWithString: "Paste text and click Copy as \(outputFileName)."
+        )
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
@@ -419,6 +466,11 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
         self.editorPanel = panel
         self.editorTextView = textView
+        self.titleLabel = titleLabel
+        self.copyButton = copyButton
+        self.fileNameField = fileNameField
+        self.extensionPopupButton = extensionPopupButton
+        self.pathLabel = pathLabel
         self.statusLabel = statusLabel
         self.successOverlay = successOverlay
         self.successIconView = successIconView
@@ -455,6 +507,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
         let wasVisible = editorPanel.isVisible
         if !wasVisible {
+            resetFileSettings()
             clearEditorText()
         }
         centerEditorPanel()
@@ -520,8 +573,50 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         editorTextView?.setSelectedRange(NSRange(location: 0, length: 0))
     }
 
+    func controlTextDidChange(_ notification: Notification) {
+        guard let changedField = notification.object as? NSTextField,
+              let fileNameField,
+              changedField === fileNameField else {
+            return
+        }
+
+        selectedFileBaseName = changedField.stringValue
+        updateFormatLabels()
+    }
+
+    @objc private func fileExtensionChanged(_ sender: NSPopUpButton) {
+        selectedFileExtension = sender.titleOfSelectedItem ?? defaultFileExtension
+        updateFormatLabels()
+        updateStatus("File extension set to \(selectedFileExtension).")
+    }
+
+    private func resetFileSettings() {
+        selectedFileBaseName = defaultFileBaseName
+        selectedFileExtension = defaultFileExtension
+        fileNameField?.stringValue = defaultFileBaseName
+        extensionPopupButton?.selectItem(withTitle: defaultFileExtension)
+        updateFormatLabels()
+    }
+
+    private func updateFormatLabels() {
+        titleLabel?.stringValue = "Create \(outputFileName)"
+        copyButton?.title = "Copy as \(outputFileName)"
+        pathLabel?.stringValue = "Creates and replaces: \(outputURL.path)"
+        pathLabel?.toolTip = outputURL.path
+    }
+
     @objc private func copyAsFile() {
         guard let editorTextView else { return }
+        if let fileNameField {
+            selectedFileBaseName = fileNameField.stringValue
+        }
+
+        guard !selectedFileBaseName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !selectedFileBaseName.contains("/") else {
+            showError(FilerError.invalidFileName.localizedDescription)
+            return
+        }
+
         guard !editorTextView.string.isEmpty else {
             showError("Enter or paste text before copying the file.")
             return
@@ -530,7 +625,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate 
         do {
             try writeTextFile(editorTextView.string)
             try copyFileToClipboard(outputURL)
-            updateStatus("Copied file.txt to clipboard as a Finder file.")
+            updateStatus("Copied \(outputFileName) to clipboard as a Finder file.")
             showSuccessAndClose()
         } catch {
             showError(error.localizedDescription)
