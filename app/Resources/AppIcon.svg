@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256" role="img" aria-label="Filer app icon">
+  <rect x="14" y="14" width="228" height="228" rx="49" fill="#18181b"/>
+  <g fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M92 68 H145 L172 95 V178 Q172 188 162 188 H94 Q84 188 84 178 V78 Q84 68 92 68 Z"/>
+    <path d="M145 68 V86 Q145 95 154 95 H172"/>
+  </g>
+  <text x="218" y="217" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="end">a.</text>
+</svg>
