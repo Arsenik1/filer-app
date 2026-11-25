@@ -46,7 +46,6 @@ private enum FilerError: LocalizedError {
 }
 
 private final class FilerTextView: NSTextView {
-    var onCommandReturn: (() -> Void)?
     var onEscape: (() -> Void)?
     var onPasteImage: (() -> Bool)?
 
@@ -57,13 +56,6 @@ private final class FilerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-
-        if event.keyCode == 36, modifiers.contains(.command) {
-            onCommandReturn?()
-            return
-        }
-
         if event.keyCode == 53 {
             onEscape?()
             return
@@ -99,7 +91,6 @@ private final class FilerTextView: NSTextView {
 
 private final class FilerImagePasteView: NSImageView {
     var onPaste: (() -> Void)?
-    var onCommandReturn: (() -> Void)?
     var onEscape: (() -> Void)?
 
     private let placeholder = NSTextField(labelWithString: "Press ⌘V to paste an image")
@@ -149,9 +140,7 @@ private final class FilerImagePasteView: NSImageView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36, event.modifierFlags.contains(.command) {
-            onCommandReturn?()
-        } else if event.keyCode == 53 {
+        if event.keyCode == 53 {
             onEscape?()
         } else {
             super.keyDown(with: event)
@@ -189,8 +178,31 @@ private final class FilerPopupBackgroundView: NSVisualEffectView {
 }
 
 private final class FilerPanel: NSPanel {
+    weak var copyButton: NSButton?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        handleCopyShortcut(event) || super.performKeyEquivalent(with: event)
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if !handleCopyShortcut(event) {
+            super.sendEvent(event)
+        }
+    }
+
+    private func handleCopyShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.modifierFlags.contains(.command),
+              event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter),
+              let copyButton else { return false }
+
+        if !event.isARepeat {
+            copyButton.performClick(nil)
+        }
+        return true
+    }
 }
 
 @main
@@ -427,6 +439,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         copyButton.bezelStyle = .rounded
         copyButton.keyEquivalent = "\r"
         copyButton.keyEquivalentModifierMask = [.command]
+        panel.copyButton = copyButton
 
         let fileNameField = NSTextField(string: defaultFileBaseName)
         fileNameField.isEditable = true
@@ -564,9 +577,6 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         NSLayoutConstraint.activate(constraints)
 
-        textView.onCommandReturn = { [weak self] in
-            self?.copyAsFile()
-        }
         textView.onEscape = { [weak self] in
             self?.closeEditor()
         }
@@ -576,7 +586,6 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         imagePasteView.onPaste = { [weak self] in
             self?.pasteClipboard()
         }
-        imagePasteView.onCommandReturn = textView.onCommandReturn
         imagePasteView.onEscape = textView.onEscape
 
         self.editorPanel = panel
@@ -816,6 +825,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     @objc private func copyAsFile() {
         guard let editorTextView else { return }
         if let fileNameField {
+            fileNameField.validateEditing()
             selectedFileBaseName = fileNameField.stringValue
         }
 
