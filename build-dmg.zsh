@@ -25,13 +25,15 @@ Filer
 2. Open Filer from Applications.
 3. Click the F status bar icon or press Ctrl + Option + Cmd + F.
 4. Enter a file name (file is the default).
-5. Paste text into the editor and choose the desired file extension from the dropdown (file.md is the default).
+5. Paste or type text, or paste a clipboard image with Command + V. Choose an
+   extension from the dropdown. In image mode, Clear returns to the text editor.
 6. Click the copy button or press Command + Return.
 7. Paste the resulting file into Finder, a chat, or a file upload field.
 
 The app always replaces the same file:
 the macOS temporary directory's Filer/<name>.<extension>. The name resets to
-file and the extension to .md each time the panel opens.
+file each time the panel opens. The default extension is .md for text, or
+a matching image extension for clipboard images.
 EOF
 
 rm -f "$DMG_PATH"

@@ -2,7 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
-SOURCE_FILE="$SCRIPT_DIR/app/FilerApp.swift"
 APP_DIR="$SCRIPT_DIR/build/Filer.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -16,12 +15,13 @@ fi
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 
-swiftc "$SOURCE_FILE" \
+swiftc "$SCRIPT_DIR"/app/*.swift \
   -target "$TARGET_TRIPLE" \
   -Xlinker -no_adhoc_codesign \
   -framework AppKit \
   -framework Carbon \
   -framework Foundation \
+  -framework ImageIO \
   "${SWIFT_FLAGS[@]}" \
   -o "$MACOS_DIR/Filer"
 

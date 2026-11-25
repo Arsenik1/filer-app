@@ -48,6 +48,13 @@ private enum FilerError: LocalizedError {
 private final class FilerTextView: NSTextView {
     var onCommandReturn: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onPasteImage: (() -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if onPasteImage?() != true {
+            super.paste(sender)
+        }
+    }
 
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -90,6 +97,68 @@ private final class FilerTextView: NSTextView {
     }
 }
 
+private final class FilerImagePasteView: NSImageView {
+    var onPaste: (() -> Void)?
+    var onCommandReturn: (() -> Void)?
+    var onEscape: (() -> Void)?
+
+    private let placeholder = NSTextField(labelWithString: "Press ⌘V to paste an image")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        imageFrameStyle = .grayBezel
+        imageScaling = .scaleProportionallyDown
+        setAccessibilityLabel("Clipboard image preview")
+
+        placeholder.textColor = .secondaryLabelColor
+        placeholder.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(placeholder)
+        NSLayoutConstraint.activate([
+            placeholder.centerXAnchor.constraint(equalTo: centerXAnchor),
+            placeholder.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    func display(_ preview: NSImage?) {
+        image = preview
+        placeholder.isHidden = preview != nil
+    }
+
+    @objc func paste(_ sender: Any?) {
+        onPaste?()
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if window?.firstResponder === self, event.keyCode == UInt16(kVK_ANSI_V),
+           modifiers == [.command] {
+            paste(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36, event.modifierFlags.contains(.command) {
+            onCommandReturn?()
+        } else if event.keyCode == 53 {
+            onEscape?()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+}
+
 private final class FilerPopupBackgroundView: NSVisualEffectView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -124,6 +193,7 @@ private final class FilerPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+@main
 private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private let fileManager = FileManager.default
 
@@ -131,7 +201,10 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var statusItem: NSStatusItem?
     private var editorPanel: NSPanel?
     private var editorTextView: FilerTextView?
+    private var textScrollView: NSScrollView?
+    private var imagePasteView: FilerImagePasteView?
     private var titleLabel: NSTextField?
+    private var subtitleLabel: NSTextField?
     private var copyButton: NSButton?
     private var fileNameField: NSTextField?
     private var extensionPopupButton: NSPopUpButton?
@@ -142,7 +215,16 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var successDismissWorkItem: DispatchWorkItem?
     private var activeFeedbackSound: NSSound?
     private var selectedFileBaseName = defaultFileBaseName
-    private var selectedFileExtension = defaultFileExtension
+    private var selectedTextExtension = defaultFileExtension
+    private var selectedImageFormat: ImageFileFormat = .png
+    private var isImageMode = false
+    private var imageFormatWasManuallySelected = false
+    private var pastedImage: ClipboardImage?
+    private var imageDetectionTask: Task<Void, Never>?
+
+    private var selectedFileExtension: String {
+        isImageMode ? selectedImageFormat.rawValue : selectedTextExtension
+    }
 
     private var outputFileName: String {
         "\(selectedFileBaseName)\(selectedFileExtension)"
@@ -152,6 +234,13 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         fileManager.temporaryDirectory
             .appendingPathComponent(outputDirectoryName, isDirectory: true)
             .appendingPathComponent(outputFileName, isDirectory: false)
+    }
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = FilerApp()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -302,6 +391,20 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         textView.isContinuousSpellCheckingEnabled = false
         scrollView.documentView = textView
 
+        let editorArea = NSView()
+        let imagePasteView = FilerImagePasteView()
+        imagePasteView.isHidden = true
+        for editor in [scrollView, imagePasteView] as [NSView] {
+            editor.translatesAutoresizingMaskIntoConstraints = false
+            editorArea.addSubview(editor)
+            NSLayoutConstraint.activate([
+                editor.topAnchor.constraint(equalTo: editorArea.topAnchor),
+                editor.leadingAnchor.constraint(equalTo: editorArea.leadingAnchor),
+                editor.trailingAnchor.constraint(equalTo: editorArea.trailingAnchor),
+                editor.bottomAnchor.constraint(equalTo: editorArea.bottomAnchor),
+            ])
+        }
+
         let pasteButton = NSButton(
             title: "Paste Clipboard",
             target: self,
@@ -312,7 +415,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let clearButton = NSButton(
             title: "Clear",
             target: self,
-            action: #selector(clearText)
+            action: #selector(clearEditor)
         )
         clearButton.bezelStyle = .rounded
 
@@ -400,7 +503,11 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         successIconView.translatesAutoresizingMaskIntoConstraints = false
         successOverlay.addSubview(successIconView)
 
-        [titleLabel, subtitleLabel, scrollView, buttonStack, pathLabel, statusLabel, closeButton, successOverlay].forEach {
+        let panelViews = [
+            titleLabel, subtitleLabel, editorArea, buttonStack,
+            pathLabel, statusLabel, closeButton, successOverlay,
+        ]
+        panelViews.forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             rootView.addSubview($0)
         }
@@ -419,11 +526,11 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             subtitleLabel.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             subtitleLabel.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
 
-            scrollView.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 14),
-            scrollView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
-            scrollView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
-            scrollView.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
-            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            editorArea.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 14),
+            editorArea.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
+            editorArea.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
+            editorArea.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
+            editorArea.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
 
             buttonStack.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             buttonStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
@@ -463,10 +570,21 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         textView.onEscape = { [weak self] in
             self?.closeEditor()
         }
+        textView.onPasteImage = { [weak self] in
+            self?.pasteImageIfAvailable() ?? false
+        }
+        imagePasteView.onPaste = { [weak self] in
+            self?.pasteClipboard()
+        }
+        imagePasteView.onCommandReturn = textView.onCommandReturn
+        imagePasteView.onEscape = textView.onEscape
 
         self.editorPanel = panel
         self.editorTextView = textView
+        self.textScrollView = scrollView
+        self.imagePasteView = imagePasteView
         self.titleLabel = titleLabel
+        self.subtitleLabel = subtitleLabel
         self.copyButton = copyButton
         self.fileNameField = fileNameField
         self.extensionPopupButton = extensionPopupButton
@@ -497,7 +615,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     private func showEditor(source: String) {
-        guard let editorPanel, let editorTextView else { return }
+        guard let editorPanel else { return }
 
         resetSuccessOverlay()
         if !debugBuild {
@@ -507,8 +625,8 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         let wasVisible = editorPanel.isVisible
         if !wasVisible {
-            resetFileSettings()
             clearEditorText()
+            resetEditorForClipboard()
         }
         centerEditorPanel()
 
@@ -518,7 +636,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         editorPanel.makeKeyAndOrderFront(nil)
         editorPanel.orderFrontRegardless()
-        editorPanel.makeFirstResponder(editorTextView)
+        focusEditor()
 
         if !wasVisible {
             NSAnimationContext.runAnimationGroup { context in
@@ -530,6 +648,26 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         if source != "status bar" {
             updateStatus("Editor opened from \(source).")
+        }
+    }
+
+    private func resetEditorForClipboard() {
+        let pasteboard = NSPasteboard.general
+        let bitmap = ClipboardImageSource.bitmap(in: pasteboard)
+        resetFileSettings(imageFormat: bitmap?.preferredFormat)
+
+        guard bitmap == nil, pasteboard.types?.contains(.fileURL) == true else { return }
+        let changeCount = pasteboard.changeCount
+        imageDetectionTask = Task { @MainActor [weak self] in
+            guard let format = await ClipboardImageSource.referencedFileFormat(in: pasteboard),
+                  !Task.isCancelled, pasteboard.changeCount == changeCount,
+                  let self, editorPanel?.isVisible == true,
+                  editorTextView?.string.isEmpty == true, !isImageMode else { return }
+
+            let editorWasFocused = editorPanel?.firstResponder === editorTextView
+            selectedImageFormat = format
+            setImageMode(true)
+            if editorWasFocused { focusEditor() }
         }
     }
 
@@ -547,6 +685,12 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func pasteClipboard() {
+        if pasteImageIfAvailable() { return }
+        if isImageMode {
+            showError("Clipboard does not contain a supported image.")
+            return
+        }
+
         guard let editorTextView else { return }
         guard let clipboardText = NSPasteboard.general.string(forType: .string) else {
             showError(FilerError.clipboardDoesNotContainText.localizedDescription)
@@ -561,10 +705,49 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         updateStatus("Clipboard text loaded.")
     }
 
-    @objc private func clearText() {
-        clearEditorText()
-        editorPanel?.makeFirstResponder(editorTextView)
+    private func pasteImageIfAvailable() -> Bool {
+        imageDetectionTask?.cancel()
+        let pasteboard = NSPasteboard.general
+        guard let source = ClipboardImageSource.detect(in: pasteboard) else { return false }
+        do {
+            let image = try source.load(from: pasteboard)
+            if !imageFormatWasManuallySelected {
+                selectedImageFormat = source.preferredFormat
+            }
+            setImageMode(true)
+            pastedImage = image
+            imagePasteView?.display(image.preview)
+            focusEditor()
+            updateStatus("Clipboard image loaded.")
+        } catch {
+            showError(error.localizedDescription)
+        }
+        return true
+    }
+
+    @objc private func clearEditor() {
+        imageDetectionTask?.cancel()
+        if isImageMode {
+            clearEditorImage()
+            setImageMode(false)
+        } else {
+            clearEditorText()
+        }
+        focusEditor()
         updateStatus("Ready for text.")
+    }
+
+    private func focusEditor() {
+        let responder: NSResponder? = isImageMode ? imagePasteView : editorTextView
+        editorPanel?.makeFirstResponder(responder)
+    }
+
+    private func clearEditorImage() {
+        imageDetectionTask?.cancel()
+        imageDetectionTask = nil
+        imageFormatWasManuallySelected = false
+        pastedImage = nil
+        imagePasteView?.display(nil)
     }
 
     private func clearEditorText() {
@@ -585,16 +768,41 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc private func fileExtensionChanged(_ sender: NSPopUpButton) {
-        selectedFileExtension = sender.titleOfSelectedItem ?? defaultFileExtension
+        if isImageMode {
+            if let title = sender.titleOfSelectedItem, let format = ImageFileFormat(rawValue: title) {
+                selectedImageFormat = format
+                imageFormatWasManuallySelected = true
+            }
+        } else {
+            selectedTextExtension = sender.titleOfSelectedItem ?? defaultFileExtension
+        }
         updateFormatLabels()
         updateStatus("File extension set to \(selectedFileExtension).")
     }
 
-    private func resetFileSettings() {
+    private func resetFileSettings(imageFormat: ImageFileFormat?) {
         selectedFileBaseName = defaultFileBaseName
-        selectedFileExtension = defaultFileExtension
+        selectedTextExtension = defaultFileExtension
+        selectedImageFormat = imageFormat ?? .png
         fileNameField?.stringValue = defaultFileBaseName
-        extensionPopupButton?.selectItem(withTitle: defaultFileExtension)
+        setImageMode(imageFormat != nil)
+    }
+
+    private func setImageMode(_ enabled: Bool) {
+        if isImageMode != enabled {
+            isImageMode = enabled
+            textScrollView?.isHidden = enabled
+            imagePasteView?.isHidden = !enabled
+            subtitleLabel?.stringValue = enabled
+                ? "Paste an image below, then copy it as a Finder file. Clear returns to text."
+                : "Paste text below, then copy it as a Finder file."
+
+            extensionPopupButton?.removeAllItems()
+            extensionPopupButton?.addItems(
+                withTitles: enabled ? ImageFileFormat.allCases.map(\.rawValue) : fileExtensions
+            )
+        }
+        extensionPopupButton?.selectItem(withTitle: selectedFileExtension)
         updateFormatLabels()
     }
 
@@ -617,13 +825,22 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             return
         }
 
-        guard !editorTextView.string.isEmpty else {
-            showError("Enter or paste text before copying the file.")
-            return
-        }
-
         do {
-            try writeTextFile(editorTextView.string)
+            let data: Data
+            if isImageMode {
+                guard let pastedImage else {
+                    showError("Paste an image before copying the file.")
+                    return
+                }
+                data = try pastedImage.encoded(as: selectedImageFormat)
+            } else {
+                guard !editorTextView.string.isEmpty else {
+                    showError("Enter or paste text before copying the file.")
+                    return
+                }
+                data = Data(editorTextView.string.utf8)
+            }
+            try writeFile(data)
             try copyFileToClipboard(outputURL)
             updateStatus("Copied \(outputFileName) to clipboard as a Finder file.")
             showSuccessAndClose()
@@ -700,6 +917,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             guard let self else { return }
             editorPanel.orderOut(nil)
             editorPanel.alphaValue = 1
+            self.clearEditorImage()
             self.resetSuccessOverlay()
         })
     }
@@ -719,6 +937,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         successDismissWorkItem?.cancel()
         editorPanel?.orderOut(nil)
         editorPanel?.alphaValue = 1
+        clearEditorImage()
         resetSuccessOverlay()
     }
 
@@ -726,7 +945,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         NSApp.terminate(nil)
     }
 
-    private func writeTextFile(_ text: String) throws {
+    private func writeFile(_ data: Data) throws {
         let directoryURL = outputURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
 
@@ -735,7 +954,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             try fileManager.removeItem(at: outputURL)
         }
 
-        try Data(text.utf8).write(to: outputURL, options: .atomic)
+        try data.write(to: outputURL, options: .atomic)
     }
 
     private func copyFileToClipboard(_ fileURL: URL) throws {
@@ -814,8 +1033,3 @@ private func fourCharCode(_ string: String) -> OSType {
     }
     return result
 }
-
-let app = NSApplication.shared
-private let delegate = FilerApp()
-app.delegate = delegate
-app.run()
