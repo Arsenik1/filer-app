@@ -93,7 +93,7 @@ enum ClipboardImageSource {
 }
 
 struct ClipboardImage {
-    let preview: NSImage
+    let raster: CGImage
     private let data: Data
     private let source: CGImageSource
     private let sourceType: String
@@ -104,18 +104,34 @@ struct ClipboardImage {
               let sourceType = CGImageSourceGetType(source) as String?,
               supportedTypes.contains(sourceType),
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
-              let preview = NSImage(data: data), preview.isValid else {
+              let raster = Self.orientedRaster(from: source) else {
             throw ClipboardImageError.unreadableImage
         }
         self.data = data
         self.source = source
         self.sourceType = sourceType
-        self.preview = preview
+        self.raster = raster
     }
 
-    func encoded(as format: ImageFileFormat) throws -> Data {
+    private static func orientedRaster(from source: CGImageSource) -> CGImage? {
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let orientation = properties?[kCGImagePropertyOrientation] as? Int ?? 1
+        if orientation != 1,
+           let width = properties?[kCGImagePropertyPixelWidth] as? Int,
+           let height = properties?[kCGImagePropertyPixelHeight] as? Int {
+            let options = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(width, height),
+            ] as CFDictionary
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+        }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    func encoded(as format: ImageFileFormat, strokes: [ImageStroke] = []) throws -> Data {
         let targetType = format.type.identifier
-        if targetType == sourceType {
+        if strokes.isEmpty && targetType == sourceType {
             return data
         }
 
@@ -128,10 +144,36 @@ struct ClipboardImage {
 
         let options = format == .png
             ? nil : [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
-        CGImageDestinationAddImageFromSource(destination, source, 0, options)
+        if strokes.isEmpty {
+            CGImageDestinationAddImageFromSource(destination, source, 0, options)
+        } else {
+            let markedImage = try render(strokes: strokes, format: format)
+            CGImageDestinationAddImage(destination, markedImage, options)
+        }
         guard CGImageDestinationFinalize(destination) else {
             throw ClipboardImageError.encodingFailed(format)
         }
         return result as Data
+    }
+
+    private func render(strokes: [ImageStroke], format: ImageFileFormat) throws -> CGImage {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil, width: raster.width, height: raster.height, bitsPerComponent: 8,
+                  bytesPerRow: 0, space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { throw ClipboardImageError.encodingFailed(format) }
+
+        let bounds = CGRect(x: 0, y: 0, width: raster.width, height: raster.height)
+        if format != .png {
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(bounds)
+        }
+        context.draw(raster, in: bounds)
+        for stroke in strokes {
+            stroke.draw(in: context)
+        }
+        guard let image = context.makeImage() else { throw ClipboardImageError.encodingFailed(format) }
+        return image
     }
 }

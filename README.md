@@ -31,9 +31,10 @@ open -n -g "./build/Filer.app"
 ## How It Works
 
 1. Opening the popup clears its editor and resets the name to `file`. If there is an image on the clipboard, Filer shows an image paste area instead of the text editor.
-2. Paste to preview the image, or click `Clear` to return to text. `Copy as…` writes the file to the macOS temporary directory.
-3. The file is copied to the clipboard as a Finder file.
-4. The same global shortcut closes the popup when it is open.
+2. Paste to preview the image at its native pixel scale when it fits, or click `Clear` to return to text. Draw with `Red Pen`, adjust its width from 1 to 30 image pixels (default: 5), or remove the last mark with `Cmd + Z` or `Undo Stroke`.
+3. `Copy as…` writes the file to the macOS temporary directory. The saved image includes any marks and is not resized to the preview.
+4. The file is copied to the clipboard as a Finder file.
+5. The same global shortcut closes the popup when it is open.
 
 ## File Options
 
@@ -53,7 +54,8 @@ The selected file replaces any existing file with the same name and extension in
 
 ```zsh
 mkdir -p build
-swiftc app/ClipboardImage.swift tests/ClipboardImageTests.swift -o build/clipboard-image-tests
+swiftc app/ClipboardImage.swift app/ImageStroke.swift tests/ClipboardImageTests.swift \
+  -o build/clipboard-image-tests
 ./build/clipboard-image-tests
 ```
 

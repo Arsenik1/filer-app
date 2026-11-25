@@ -9,6 +9,8 @@ private let hotkeyDescription = "Ctrl + Option + Cmd + F"
 private let outputDirectoryName = "Filer"
 private let defaultFileBaseName = "file"
 private let defaultFileExtension = ".md"
+private let textPanelSize = NSSize(width: 640, height: 480)
+private let imagePanelSize = NSSize(width: 900, height: 620)
 private let fileExtensions = [
     ".md",
     ".txt",
@@ -89,16 +91,24 @@ private final class FilerTextView: NSTextView {
     }
 }
 
-private final class FilerImagePasteView: NSImageView {
+private final class FilerImagePasteView: NSView {
     var onPaste: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onStrokesChanged: (() -> Void)?
+    var penWidth = ImageStroke.defaultWidth
+    var penEnabled = true {
+        didSet { window?.invalidateCursorRects(for: self) }
+    }
 
+    private(set) var strokes: [ImageStroke] = []
+    private var raster: CGImage?
+    private var isDrawing = false
     private let placeholder = NSTextField(labelWithString: "Press ⌘V to paste an image")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        imageFrameStyle = .grayBezel
-        imageScaling = .scaleProportionallyDown
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
         setAccessibilityLabel("Clipboard image preview")
 
         placeholder.textColor = .secondaryLabelColor
@@ -115,14 +125,109 @@ private final class FilerImagePasteView: NSImageView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    private var imageRect: NSRect {
+        guard let raster, bounds.width > 0, bounds.height > 0 else { return .zero }
+        let scale = min(
+            1 / (window?.backingScaleFactor ?? 1),
+            bounds.width / CGFloat(raster.width),
+            bounds.height / CGFloat(raster.height)
+        )
+        let width = CGFloat(raster.width) * scale
+        let height = CGFloat(raster.height) * scale
+        return NSRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2,
+                      width: width, height: height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let raster else {
+            NSColor.separatorColor.setStroke()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 5, yRadius: 5)
+                .stroke()
+            return
+        }
+
+        let rect = imageRect
+        guard !rect.isEmpty else { return }
+        context.draw(raster, in: rect)
+        context.saveGState()
+        context.clip(to: rect)
+        context.translateBy(x: rect.minX, y: rect.minY)
+        let scale = rect.width / CGFloat(raster.width)
+        context.scaleBy(x: scale, y: scale)
+        for stroke in strokes { stroke.draw(in: context) }
+        context.restoreGState()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        let rect = imageRect
+        if penEnabled, !rect.isEmpty { addCursorRect(rect, cursor: .crosshair) }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        let location = convert(event.locationInWindow, from: nil)
+        guard penEnabled, imageRect.contains(location), let point = imagePoint(at: location)
+        else { return }
+
+        strokes.append(ImageStroke(points: [point], width: penWidth))
+        isDrawing = true
+        needsDisplay = true
+        onStrokesChanged?()
     }
 
-    func display(_ preview: NSImage?) {
-        image = preview
-        placeholder.isHidden = preview != nil
+    override func mouseDragged(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard isDrawing, let point = imagePoint(at: location), let lastStroke = strokes.indices.last,
+              strokes[lastStroke].points.last != point else { return }
+        strokes[lastStroke].points.append(point)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        mouseDragged(with: event)
+        isDrawing = false
+    }
+
+    private func imagePoint(at location: NSPoint) -> CGPoint? {
+        let rect = imageRect
+        guard !rect.isEmpty, let raster else { return nil }
+        let pixelsPerPoint = CGFloat(raster.width) / rect.width
+        return CGPoint(x: (location.x - rect.minX) * pixelsPerPoint,
+                       y: (location.y - rect.minY) * pixelsPerPoint)
+    }
+
+    func display(_ raster: CGImage?) {
+        self.raster = raster
+        placeholder.isHidden = raster != nil
+        strokes.removeAll()
+        isDrawing = false
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+        onStrokesChanged?()
+    }
+
+    func undoStroke() {
+        guard !strokes.isEmpty else { return }
+        strokes.removeLast()
+        isDrawing = false
+        needsDisplay = true
+        onStrokesChanged?()
     }
 
     @objc func paste(_ sender: Any?) {
@@ -194,23 +299,34 @@ private final class FilerPopupBackgroundView: NSVisualEffectView {
 
 private final class FilerPanel: NSPanel {
     weak var copyButton: NSButton?
+    weak var imagePasteView: FilerImagePasteView?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        handleCopyShortcut(event) || super.performKeyEquivalent(with: event)
+        handlePanelShortcut(event) || super.performKeyEquivalent(with: event)
     }
 
     override func sendEvent(_ event: NSEvent) {
-        if !handleCopyShortcut(event) {
+        if !handlePanelShortcut(event) {
             super.sendEvent(event)
         }
     }
 
-    private func handleCopyShortcut(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown, event.modifierFlags.contains(.command),
-              event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter),
+    private func handlePanelShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard event.type == .keyDown, modifiers.contains(.command) else { return false }
+
+        if event.keyCode == UInt16(kVK_ANSI_Z), modifiers == [.command],
+           let imagePasteView, !imagePasteView.isHiddenOrHasHiddenAncestor {
+            if !event.isARepeat {
+                imagePasteView.undoStroke()
+            }
+            return true
+        }
+
+        guard event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter),
               let copyButton else { return false }
 
         if !event.isARepeat {
@@ -230,6 +346,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var editorTextView: FilerTextView?
     private var textScrollView: NSScrollView?
     private var imagePasteView: FilerImagePasteView?
+    private var markupToolbar: NSStackView?
+    private var editorBottomConstraint: NSLayoutConstraint?
+    private var penWidthLabel: NSTextField?
     private var titleLabel: NSTextField?
     private var subtitleLabel: NSTextField?
     private var copyButton: NSButton?
@@ -362,7 +481,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     private func setupEditorPanel() {
-        let frame = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let frame = NSRect(origin: .zero, size: textPanelSize)
         let panel = FilerPanel(
             contentRect: frame,
             styleMask: [.borderless],
@@ -421,6 +540,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let editorArea = NSView()
         let imagePasteView = FilerImagePasteView()
         imagePasteView.isHidden = true
+        panel.imagePasteView = imagePasteView
         for editor in [scrollView, imagePasteView] as [NSView] {
             editor.translatesAutoresizingMaskIntoConstraints = false
             editorArea.addSubview(editor)
@@ -494,6 +614,44 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         buttonStack.distribution = .fill
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        let penButton = NSButton(
+            title: "Red Pen", target: self, action: #selector(togglePen(_:))
+        )
+        penButton.setButtonType(.pushOnPushOff)
+        penButton.bezelStyle = .rounded
+        penButton.state = .on
+
+        let penWidth = NSSlider(
+            value: Double(ImageStroke.defaultWidth),
+            minValue: Double(ImageStroke.widths.lowerBound),
+            maxValue: Double(ImageStroke.widths.upperBound),
+            target: self,
+            action: #selector(penWidthChanged(_:))
+        )
+        penWidth.isContinuous = true
+        penWidth.setAccessibilityLabel("Pen width in pixels")
+        penWidth.widthAnchor.constraint(equalToConstant: 120).isActive = true
+
+        let penWidthLabel = NSTextField(labelWithString: "\(ImageStroke.defaultWidth) px")
+        penWidthLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        penWidthLabel.widthAnchor.constraint(equalToConstant: 42).isActive = true
+
+        let undoButton = NSButton(
+            title: "Undo Stroke", target: self, action: #selector(undoImageStroke)
+        )
+        undoButton.bezelStyle = .rounded
+        undoButton.toolTip = "Undo the last stroke (⌘Z)"
+        undoButton.isEnabled = false
+
+        let markupToolbar = NSStackView(views: [penButton, penWidth, penWidthLabel, undoButton])
+        markupToolbar.orientation = .horizontal
+        markupToolbar.alignment = .centerY
+        markupToolbar.spacing = 8
+        markupToolbar.isHidden = true
+        let editorBottomConstraint = editorArea.bottomAnchor.constraint(
+            equalTo: buttonStack.topAnchor, constant: -12
+        )
+
         let pathLabel = NSTextField(labelWithString: "Creates and replaces: \(outputURL.path)")
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.font = NSFont.systemFont(ofSize: 11)
@@ -532,7 +690,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         successOverlay.addSubview(successIconView)
 
         let panelViews = [
-            titleLabel, subtitleLabel, editorArea, buttonStack,
+            titleLabel, subtitleLabel, editorArea, markupToolbar, buttonStack,
             pathLabel, statusLabel, closeButton, successOverlay,
         ]
         panelViews.forEach {
@@ -557,8 +715,11 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             editorArea.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 14),
             editorArea.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             editorArea.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
-            editorArea.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
-            editorArea.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            editorBottomConstraint,
+
+            markupToolbar.leadingAnchor.constraint(equalTo: editorArea.leadingAnchor),
+            markupToolbar.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
+            markupToolbar.heightAnchor.constraint(equalToConstant: 28),
 
             buttonStack.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             buttonStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
@@ -602,11 +763,17 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             self?.pasteClipboard()
         }
         imagePasteView.onEscape = textView.onEscape
+        imagePasteView.onStrokesChanged = { [weak imagePasteView, weak undoButton] in
+            undoButton?.isEnabled = imagePasteView?.strokes.isEmpty == false
+        }
 
         self.editorPanel = panel
         self.editorTextView = textView
         self.textScrollView = scrollView
         self.imagePasteView = imagePasteView
+        self.markupToolbar = markupToolbar
+        self.editorBottomConstraint = editorBottomConstraint
+        self.penWidthLabel = penWidthLabel
         self.titleLabel = titleLabel
         self.subtitleLabel = subtitleLabel
         self.copyButton = copyButton
@@ -691,21 +858,50 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let editorWasFocused = editorPanel?.firstResponder === editorTextView
             selectedImageFormat = format
             setImageMode(true)
+            resizeVisibleEditorPanel()
             if editorWasFocused { focusEditor() }
         }
     }
 
-    private func centerEditorPanel() {
+    private func centerEditorPanel(on preferredScreen: NSScreen? = nil) {
         guard let editorPanel else { return }
 
         let mouseLocation = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) ?? NSScreen.main
+        let screen = preferredScreen
+            ?? NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
+            ?? NSScreen.main
         let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let availableSize = visibleFrame.insetBy(dx: 16, dy: 16).size
+        var size = textPanelSize
+        if isImageMode {
+            var requestedSize = imagePanelSize
+            if let raster = pastedImage?.raster, let imagePasteView {
+                editorPanel.contentView?.layoutSubtreeIfNeeded()
+                let scale = screen?.backingScaleFactor ?? editorPanel.backingScaleFactor
+                let chromeWidth = editorPanel.frame.width - imagePasteView.frame.width
+                let chromeHeight = editorPanel.frame.height - imagePasteView.frame.height
+                requestedSize = NSSize(
+                    width: max(
+                        textPanelSize.width, ceil(CGFloat(raster.width) / scale + chromeWidth)
+                    ),
+                    height: max(
+                        textPanelSize.height, ceil(CGFloat(raster.height) / scale + chromeHeight)
+                    )
+                )
+            }
+            size = NSSize(width: min(requestedSize.width, availableSize.width),
+                          height: min(requestedSize.height, availableSize.height))
+        }
         let origin = NSPoint(
-            x: round(visibleFrame.midX - editorPanel.frame.width / 2),
-            y: round(visibleFrame.midY - editorPanel.frame.height / 2)
+            x: round(visibleFrame.midX - size.width / 2),
+            y: round(visibleFrame.midY - size.height / 2)
         )
-        editorPanel.setFrameOrigin(origin)
+        editorPanel.setFrame(NSRect(origin: origin, size: size), display: editorPanel.isVisible)
+    }
+
+    private func resizeVisibleEditorPanel() {
+        guard let editorPanel, editorPanel.isVisible else { return }
+        centerEditorPanel(on: editorPanel.screen)
     }
 
     @objc private func pasteClipboard() {
@@ -740,7 +936,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
             setImageMode(true)
             pastedImage = image
-            imagePasteView?.display(image.preview)
+            imagePasteView?.display(image.raster)
+            setMarkupToolbarVisible(true)
+            resizeVisibleEditorPanel()
             focusEditor()
             updateStatus("Clipboard image loaded.")
         } catch {
@@ -754,6 +952,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if isImageMode {
             clearEditorImage()
             setImageMode(false)
+            resizeVisibleEditorPanel()
         } else {
             clearEditorText()
         }
@@ -772,6 +971,29 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         imageFormatWasManuallySelected = false
         pastedImage = nil
         imagePasteView?.display(nil)
+        setMarkupToolbarVisible(false)
+    }
+
+    private func setMarkupToolbarVisible(_ visible: Bool) {
+        markupToolbar?.isHidden = !visible
+        editorBottomConstraint?.constant = visible ? -46 : -12
+    }
+
+    @objc private func togglePen(_ sender: NSButton) {
+        imagePasteView?.penEnabled = sender.state == .on
+        focusEditor()
+    }
+
+    @objc private func penWidthChanged(_ sender: NSSlider) {
+        let width = Int(sender.doubleValue.rounded())
+        sender.integerValue = width
+        imagePasteView?.penWidth = width
+        penWidthLabel?.stringValue = "\(width) px"
+    }
+
+    @objc private func undoImageStroke() {
+        imagePasteView?.undoStroke()
+        focusEditor()
     }
 
     private func clearEditorText() {
@@ -857,7 +1079,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
                     showError("Paste an image before copying the file.")
                     return
                 }
-                data = try pastedImage.encoded(as: selectedImageFormat)
+                data = try pastedImage.encoded(
+                    as: selectedImageFormat, strokes: imagePasteView?.strokes ?? []
+                )
             } else {
                 guard !editorTextView.string.isEmpty else {
                     showError("Enter or paste text before copying the file.")
