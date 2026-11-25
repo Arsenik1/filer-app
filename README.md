@@ -40,6 +40,7 @@ open -n -g "./build/Filer.app"
 
 - Default name: `file`
 - Text extensions: `.md` (default), `.txt`, `.json`, `.sql`, `.js`, `.html`, `.css`, `.py`, `.ts`
+- For other text extensions, select `Custom…` and enter a suffix such as `log` or `.tar.gz`. The leading dot is optional; the file contents are still plain text.
 - Image extensions: `.png`, `.jpg`, `.jpeg`. Filer defaults to the clipboard image's format, or PNG for a clipboard bitmap provided as TIFF.
 - File names cannot be empty or contain `/`.
 

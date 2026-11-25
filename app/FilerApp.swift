@@ -11,7 +11,8 @@ private let defaultFileBaseName = "file"
 private let defaultFileExtension = ".md"
 private let textPanelSize = NSSize(width: 640, height: 480)
 private let imagePanelSize = NSSize(width: 900, height: 620)
-private let fileExtensions = [
+private let customExtensionChoice = "Custom…"
+private let textExtensionChoices = [
     ".md",
     ".txt",
     ".json",
@@ -21,6 +22,7 @@ private let fileExtensions = [
     ".css",
     ".py",
     ".ts",
+    customExtensionChoice,
 ]
 private let successSoundName = "Blow"
 
@@ -354,6 +356,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var copyButton: NSButton?
     private var fileNameField: NSTextField?
     private var extensionPopupButton: NSPopUpButton?
+    private var customExtensionRow: NSStackView?
+    private var customExtensionField: NSTextField?
+    private var customExtensionHint: NSTextField?
     private var pathLabel: NSTextField?
     private var statusLabel: NSTextField?
     private var successOverlay: NSVisualEffectView?
@@ -368,12 +373,28 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var pastedImage: ClipboardImage?
     private var imageDetectionTask: Task<Void, Never>?
 
-    private var selectedFileExtension: String {
+    private var selectedExtensionChoice: String {
         isImageMode ? selectedImageFormat.rawValue : selectedTextExtension
     }
 
+    private var usesCustomExtension: Bool { selectedExtensionChoice == customExtensionChoice }
+
+    private var customExtensionInput: String {
+        customExtensionField?.currentEditor()?.string ?? customExtensionField?.stringValue ?? ""
+    }
+
+    private var selectedFileExtension: String? {
+        guard usesCustomExtension else { return selectedExtensionChoice }
+        let input = customExtensionInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = input.hasPrefix(".") ? String(input.dropFirst()) : input
+        let disallowed = CharacterSet(charactersIn: "/\\:").union(.controlCharacters)
+        guard suffix.contains(where: { !$0.isWhitespace && $0 != "." }),
+              suffix.rangeOfCharacter(from: disallowed) == nil else { return nil }
+        return ".\(suffix)"
+    }
+
     private var outputFileName: String {
-        "\(selectedFileBaseName)\(selectedFileExtension)"
+        "\(selectedFileBaseName)\(selectedFileExtension ?? "")"
     }
 
     private var outputURL: URL {
@@ -587,7 +608,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         fileNameField.widthAnchor.constraint(equalToConstant: 120).isActive = true
 
         let extensionPopupButton = NSPopUpButton(frame: .zero, pullsDown: false)
-        extensionPopupButton.addItems(withTitles: fileExtensions)
+        extensionPopupButton.addItems(withTitles: textExtensionChoices)
         extensionPopupButton.selectItem(withTitle: defaultFileExtension)
         extensionPopupButton.target = self
         extensionPopupButton.action = #selector(fileExtensionChanged(_:))
@@ -613,6 +634,23 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         buttonStack.spacing = 8
         buttonStack.distribution = .fill
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let customExtensionField = NSTextField(string: "")
+        customExtensionField.bezelStyle = .roundedBezel
+        customExtensionField.placeholderString = "e.g. log or .tar.gz"
+        customExtensionField.setAccessibilityLabel("Custom file extension")
+        customExtensionField.delegate = self
+        customExtensionField.widthAnchor.constraint(equalToConstant: 144).isActive = true
+
+        let customExtensionHint = NSTextField(labelWithString: "")
+        customExtensionHint.textColor = .secondaryLabelColor
+        let customExtensionRow = NSStackView(views: [
+            NSTextField(labelWithString: "Extension"), customExtensionField, customExtensionHint,
+        ])
+        customExtensionRow.orientation = .horizontal
+        customExtensionRow.alignment = .centerY
+        customExtensionRow.spacing = 8
+        customExtensionRow.isHidden = true
 
         let penButton = NSButton(
             title: "Red Pen", target: self, action: #selector(togglePen(_:))
@@ -690,7 +728,7 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         successOverlay.addSubview(successIconView)
 
         let panelViews = [
-            titleLabel, subtitleLabel, editorArea, markupToolbar, buttonStack,
+            titleLabel, subtitleLabel, editorArea, markupToolbar, customExtensionRow, buttonStack,
             pathLabel, statusLabel, closeButton, successOverlay,
         ]
         panelViews.forEach {
@@ -720,6 +758,10 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             markupToolbar.leadingAnchor.constraint(equalTo: editorArea.leadingAnchor),
             markupToolbar.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
             markupToolbar.heightAnchor.constraint(equalToConstant: 28),
+
+            customExtensionRow.leadingAnchor.constraint(equalTo: editorArea.leadingAnchor),
+            customExtensionRow.bottomAnchor.constraint(equalTo: markupToolbar.bottomAnchor),
+            customExtensionRow.heightAnchor.constraint(equalTo: markupToolbar.heightAnchor),
 
             buttonStack.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             buttonStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
@@ -779,6 +821,9 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         self.copyButton = copyButton
         self.fileNameField = fileNameField
         self.extensionPopupButton = extensionPopupButton
+        self.customExtensionRow = customExtensionRow
+        self.customExtensionField = customExtensionField
+        self.customExtensionHint = customExtensionHint
         self.pathLabel = pathLabel
         self.statusLabel = statusLabel
         self.successOverlay = successOverlay
@@ -976,7 +1021,16 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     private func setMarkupToolbarVisible(_ visible: Bool) {
         markupToolbar?.isHidden = !visible
-        editorBottomConstraint?.constant = visible ? -46 : -12
+        updateAccessoryLayout()
+    }
+
+    private func updateAccessoryLayout() {
+        if !usesCustomExtension, customExtensionField?.currentEditor() != nil {
+            focusEditor()
+        }
+        customExtensionRow?.isHidden = !usesCustomExtension
+        let showsAccessory = usesCustomExtension || markupToolbar?.isHidden == false
+        editorBottomConstraint?.constant = showsAccessory ? -46 : -12
     }
 
     @objc private func togglePen(_ sender: NSButton) {
@@ -1003,13 +1057,12 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func controlTextDidChange(_ notification: Notification) {
-        guard let changedField = notification.object as? NSTextField,
-              let fileNameField,
-              changedField === fileNameField else {
+        guard let changedField = notification.object as? NSTextField else { return }
+        if changedField === fileNameField {
+            selectedFileBaseName = changedField.stringValue
+        } else if changedField !== customExtensionField {
             return
         }
-
-        selectedFileBaseName = changedField.stringValue
         updateFormatLabels()
     }
 
@@ -1021,9 +1074,15 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             }
         } else {
             selectedTextExtension = sender.titleOfSelectedItem ?? defaultFileExtension
+            updateAccessoryLayout()
+            if usesCustomExtension {
+                customExtensionField?.selectText(nil)
+            }
         }
         updateFormatLabels()
-        updateStatus("File extension set to \(selectedFileExtension).")
+        if let selectedFileExtension {
+            updateStatus("File extension set to \(selectedFileExtension).")
+        }
     }
 
     private func resetFileSettings(imageFormat: ImageFileFormat?) {
@@ -1031,6 +1090,10 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         selectedTextExtension = defaultFileExtension
         selectedImageFormat = imageFormat ?? .png
         fileNameField?.stringValue = defaultFileBaseName
+        if customExtensionField?.currentEditor() != nil {
+            editorPanel?.makeFirstResponder(nil)
+        }
+        customExtensionField?.stringValue = ""
         setImageMode(imageFormat != nil)
     }
 
@@ -1045,22 +1108,34 @@ private final class FilerApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
             extensionPopupButton?.removeAllItems()
             extensionPopupButton?.addItems(
-                withTitles: enabled ? ImageFileFormat.allCases.map(\.rawValue) : fileExtensions
+                withTitles: enabled ? ImageFileFormat.allCases.map(\.rawValue) : textExtensionChoices
             )
         }
-        extensionPopupButton?.selectItem(withTitle: selectedFileExtension)
+        extensionPopupButton?.selectItem(withTitle: selectedExtensionChoice)
+        updateAccessoryLayout()
         updateFormatLabels()
     }
 
     private func updateFormatLabels() {
+        let validExtension = selectedFileExtension != nil
+        copyButton?.isEnabled = validExtension
+        if usesCustomExtension {
+            customExtensionHint?.stringValue = validExtension ? "" : "Enter a valid extension."
+        }
         titleLabel?.stringValue = "Create \(outputFileName)"
-        copyButton?.title = "Copy as \(outputFileName)"
+        copyButton?.title = usesCustomExtension && (!validExtension || outputFileName.count > 24)
+            ? "Copy as File" : "Copy as \(outputFileName)"
+        copyButton?.toolTip = usesCustomExtension && validExtension ? outputFileName : nil
         pathLabel?.stringValue = "Creates and replaces: \(outputURL.path)"
         pathLabel?.toolTip = outputURL.path
     }
 
     @objc private func copyAsFile() {
         guard let editorTextView else { return }
+        guard selectedFileExtension != nil else {
+            customExtensionField?.selectText(nil)
+            return
+        }
         if let fileNameField {
             fileNameField.validateEditing()
             selectedFileBaseName = fileNameField.stringValue
