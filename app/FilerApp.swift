@@ -154,8 +154,11 @@ private final class FilerPopupBackgroundView: NSVisualEffectView {
         material = .hudWindow
         blendingMode = .withinWindow
         state = .active
+        let cornerRadius: CGFloat = 20
+        // Apply the same shape to the AppKit material and window shadow.
+        maskImage = Self.roundedMask(radius: cornerRadius)
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = cornerRadius
         layer?.masksToBounds = true
         layer?.borderWidth = 1
         updateBorderColor()
@@ -168,6 +171,18 @@ private final class FilerPopupBackgroundView: NSVisualEffectView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         updateBorderColor()
+    }
+
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let side = radius * 2 + 1
+        let mask = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        mask.resizingMode = .stretch
+        return mask
     }
 
     private func updateBorderColor() {
